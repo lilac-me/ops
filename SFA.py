@@ -107,8 +107,8 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
         grid = (batch, n_ctx)
 
         # Intermediate buffers for Triton kernel execution
+        # NOTE: V_Buffer removed - KV shares storage, only one buffer needed
         K_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_N, head_dim), device=q.device, dtype=torch.bfloat16)
-        V_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_N, head_dim), device=q.device, dtype=torch.bfloat16)
         QK_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, cfg.BLOCK_N), device=q.device, dtype=torch.float32)
         P_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, cfg.BLOCK_N), device=q.device, dtype=torch.bfloat16)
         PV_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, head_dim), device=q.device, dtype=torch.float32)
@@ -121,7 +121,6 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
             LSE_ptr=log_sum_exp,
             Out_ptr=out,
             K_Buffer_ptr=K_Buffer,
-            V_Buffer_ptr=V_Buffer,
             QK_Buffer_ptr=QK_Buffer,
             P_Buffer_ptr=P_Buffer,
             PV_Buffer_ptr=PV_Buffer,
@@ -150,7 +149,7 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
             TOPK=topk,
             BLOCK_H=cfg.BLOCK_H,
             KV_CTX=kv_ctx,
-            # **cfg.extra_args,
+            **cfg.extra_args,
         )
 
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, log_sum_exp)
@@ -243,7 +242,7 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
             NUM_BLOCKS=num_blocks_q,
             BLOCK_H=cfg.BLOCK_H_BWD,
             KV_CTX=kv_ctx,
-            # **cfg.extra_args,
+            **cfg.extra_args,
         )
 
         K_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_K_BWD, head_dim), device=q.device, dtype=torch.bfloat16)
@@ -290,7 +289,7 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
             NUM_BLOCKS=num_blocks_kv,
             BLOCK_H=cfg.BLOCK_H_BWD,
             KV_CTX=kv_ctx,
-            # **cfg.extra_args,
+            **cfg.extra_args,
         )
 
         return (
@@ -311,7 +310,6 @@ def _inner_fwd(
     lse_base,
     out_base,
     k_buf_ptr,
-    v_buf_ptr,
     qk_buf_ptr,
     p_buf_ptr,
     pv_buf_ptr,
@@ -378,11 +376,21 @@ def _inner_fwd(
     m_i = tl.full([HALF_H], -10e10, dtype=tl.float32)
     l_i = tl.zeros([HALF_H], dtype=tl.float32)
 
+    off_n_buf = tl.arange(0, BLOCK_N)
+
     for i in range(num_steps):
-        # 1. [Vector] Load Sparse KV
+        # 1. [Vector] Load Sparse KV + Cache full-block index
         start_n = i * BLOCK_N
         start_n1 = i.to(tl.float32) * BLOCK_N
 
+        # Load full-block index once (reused in softmax masking stage)
+        off_n_full_global0 = start_n + off_n_buf
+        off_n_full_global1 = start_n1 + off_n_buf.to(tl.float32)
+        n_mask_full = off_n_full_global1 < TOPK
+        k_idx_full = tl.load(idx_base + off_n_full_global0 * stride_in, mask=n_mask_full, other=-1)
+        mask_full = (k_idx_full.to(tl.float32) >= 0) & n_mask_full
+
+        # Sub-partition load for Vector Core (each sub loads HALF_N)
         off_n_local = start_n + n_offset_local + tl.arange(0, HALF_N)
         off_n_local1 = start_n1 + n_offset_local1 + tl.arange(0, HALF_N).to(tl.float32)
         n_mask = off_n_local1 < TOPK
@@ -407,7 +415,6 @@ def _inner_fwd(
         # 2. [Cube] Matrix Multi: Q @ K.T
         al.sync_block_wait("vector", "cube", 0)
 
-        off_n_buf = tl.arange(0, BLOCK_N)
         kv_load = tl.load(k_buf_ptr + off_n_buf[:, None] * HEAD_DIM + off_d[None, :])
 
         qk_full = tl.dot(q_full, tl.trans(kv_load))
@@ -416,17 +423,11 @@ def _inner_fwd(
         tl.store(qk_store_ptr, qk_full)
 
         # 3. [Vector] Softmax Update (m_i, l_i, p_sub)
-        off_n_buf = tl.arange(0, BLOCK_N)
+        # Reuse cached mask_full from stage 1 — no redundant index load
         qk_load_ptr = qk_buf_ptr + row_indices[:, None] * BLOCK_N + off_n_buf[None, :]
         qk_sub = tl.load(qk_load_ptr)
 
         qk_sub *= (sm_scale * LOG2_E)
-
-        off_n_full_global0 = start_n + off_n_buf
-        off_n_full_global1 = start_n.to(tl.float32) + off_n_buf.to(tl.float32)
-        n_mask_full = off_n_full_global1 < TOPK
-        k_idx_full = tl.load(idx_base + off_n_full_global0 * stride_in, mask=n_mask_full, other=-1).to(tl.float32)
-        mask_full = (k_idx_full >= 0) & n_mask_full
         qk_sub = tl.where(mask_full[None, :], qk_sub, -10e10)
 
         m_ij = tl.max(qk_sub, 1)
@@ -483,7 +484,6 @@ def _attn_fwd(
     LSE_ptr,
     Out_ptr,
     K_Buffer_ptr,
-    V_Buffer_ptr,
     QK_Buffer_ptr,
     P_Buffer_ptr,
     PV_Buffer_ptr,
@@ -542,7 +542,6 @@ def _attn_fwd(
     off_buf_pv = pid * (BLOCK_H * HEAD_DIM)
 
     cur_k_buf = K_Buffer_ptr + off_buf_kv
-    cur_v_buf = V_Buffer_ptr + off_buf_kv
     cur_qk_buf = QK_Buffer_ptr + off_buf_qk
     cur_p_buf = P_Buffer_ptr + off_buf_qk
     cur_pv_buf = PV_Buffer_ptr + off_buf_pv
@@ -559,7 +558,6 @@ def _attn_fwd(
             lse_base,
             out_base,
             cur_k_buf,
-            cur_v_buf,
             cur_qk_buf,
             cur_p_buf,
             cur_pv_buf,
@@ -822,7 +820,7 @@ def _inner_dkv(
         gk_ptrs = Grad_KV_ptr + idx_safe_step[:, None].to(tl.int64) * stride_gkvs + off_d[None, :] * stride_gkvd
 
         # -----------------------------------------------------------
-        # [Part A] Compute dV and store
+        # [Part A] Compute dV
         # -----------------------------------------------------------
         p_full = tl.load(p_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :])
         dv_part = tl.dot(tl.trans(p_full.to(tl.bfloat16)), do_full)
@@ -830,11 +828,9 @@ def _inner_dkv(
         tl.store(dv_buf_ptr + off_k_buf[:, None] * HEAD_DIM + off_d[None, :], dv_part)
 
         dv_val = tl.load(dv_buf_ptr + buf_k_idx0[:, None] * HEAD_DIM + off_d[None, :]).to(tl.float32)
-        dv_val = tl.where(valid_step[:, None], dv_val, 0.0)
-        tl.atomic_add(gk_ptrs, dv_val, mask=valid_step[:, None])
 
         # -----------------------------------------------------------
-        # [Part B] Compute dK and store
+        # [Part B] Compute dK
         # -----------------------------------------------------------
         ds_full = tl.load(ds_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :])
         dk_part = tl.dot(tl.trans(ds_full.to(tl.bfloat16)), q_full)
@@ -843,8 +839,13 @@ def _inner_dkv(
 
         dk_val = tl.load(dk_buf_ptr + buf_k_idx0[:, None] * HEAD_DIM + off_d[None, :]).to(tl.float32)
         dk_grad = dk_val * sm_scale
-        dk_grad = tl.where(valid_step[:, None], dk_grad, 0.0)
-        tl.atomic_add(gk_ptrs, dk_grad, mask=valid_step[:, None])
+
+        # -----------------------------------------------------------
+        # [Merged] Single atomic_add for dV + dK (halves atomic ops)
+        # -----------------------------------------------------------
+        combined_grad = dv_val + dk_grad
+        combined_grad = tl.where(valid_step[:, None], combined_grad, 0.0)
+        tl.atomic_add(gk_ptrs, combined_grad, mask=valid_step[:, None])
 
 
 @triton.jit
