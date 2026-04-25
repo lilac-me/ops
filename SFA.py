@@ -1,5 +1,4 @@
-# Copyright (c) 2023-2025; Songlin Yang; Yu Zhang
-# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Optional
@@ -24,38 +23,47 @@ class TilingBlockConfig:
     extra_args: dict
 
 
+_COMMMON_EXTRA_ARGS = {
+    "multibuffer": True,
+    "limit_auto_multi_buffer_only_for_local_buffer": False,
+    "set_workspace_multibuffer": 4,
+    "tile_mix_vector_loop": 2,
+    "tile_mix_cube_loop": 2,
+}
+
+
 CONFIG_MAP = {
     128: TilingBlockConfig(
         BLOCK_N=64, BLOCK_H=32, BLOCK_Q_BWD=64, BLOCK_K_BWD=64, BLOCK_H_BWD=32,
-        extra_args={
-            "multibuffer": True,
-            "limit_auto_multi_buffer_only_for_local_buffer": False,
-            "set_workspace_multibuffer": 4,
-            "tile_mix_vector_loop": 2,
-            "tile_mix_cube_loop": 2,
-            }
+        extra_args = _COMMMON_EXTRA_ARGS
     ),
     160: TilingBlockConfig(
         BLOCK_N=80, BLOCK_H=32, BLOCK_Q_BWD=80, BLOCK_K_BWD=40, BLOCK_H_BWD=32,
-        extra_args={
-            "multibuffer": True,
-            "limit_auto_multi_buffer_only_for_local_buffer": False,
-            "set_workspace_multibuffer": 4,
-            "tile_mix_vector_loop": 2,
-            "tile_mix_cube_loop": 2,
-            }
+        extra_args = _COMMMON_EXTRA_ARGS
     ),
     640: TilingBlockConfig(
         BLOCK_N=80, BLOCK_H=32, BLOCK_Q_BWD=80, BLOCK_K_BWD=64, BLOCK_H_BWD=32,
-        extra_args={
-            "multibuffer": True,
-            "limit_auto_multi_buffer_only_for_local_buffer": False,
-            "set_workspace_multibuffer": 4,
-            "tile_mix_vector_loop": 2,
-            "tile_mix_cube_loop": 2,
-            }
+        extra_args = _COMMMON_EXTRA_ARGS
     ),
 }
+
+
+def _resolve_tiling_config(topk: int) -> TilingBlockConfig:
+    if topk <= 0:
+        raise ValueError(f"Unsupported topk value: {topk}. Please make sure it is a positive integer.")
+    
+    if topk <= 128:
+        return CONFIG_MAP[128]
+    elif topk <= 160:
+        return CONFIG_MAP[160]
+    return CONFIG_MAP[640]
+
+
+def _effective_topk(topk_idxs: torch.Tensor) -> int:
+    if topk_idxs.numel() == 0:
+        raise ValueError("topk_idxs tensor is empty. Cannot determine effective topk.")
+    valid_counts = (topk_idxs >= 0).sum(dim=-1)
+    return int(valid_counts.max().item())
 
 
 class SparseFlashAttentionTriton(torch.autograd.Function):
@@ -90,10 +98,8 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
         kv_ctx =  kv.shape[0]
 
         # Config lookup for Triton tiling parameters
-        topk = topk_idxs.shape[-1]
-        if topk not in CONFIG_MAP:
-            raise ValueError(f"Unsupported topk value: {topk}. Please add it to CONFIG_MAP.")
-        cfg = CONFIG_MAP[topk]
+        topk = _effective_topk(topk_idxs)
+        cfg = _resolve_tiling_config(topk)
 
         out = torch.empty_like(q)
 
@@ -169,9 +175,8 @@ class SparseFlashAttentionTriton(torch.autograd.Function):
         n_ctx, batch, n_heads, head_dim = q.shape
 
         topk = int(topk_idxs.shape[-1])
-        if topk not in CONFIG_MAP:
-            raise ValueError(f"Unsupported topk value: {topk}. Please add it to CONFIG_MAP.")
-        cfg = CONFIG_MAP[topk]
+        topk = _effective_topk(topk_idxs)
+        cfg = _resolve_tiling_config(topk)
 
         if softmax_scale is None:
             softmax_scale = (1.0 / head_dim) ** 0.5
